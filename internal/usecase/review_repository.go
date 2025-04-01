@@ -7,5 +7,4 @@ import (
 
 type ReviewRepository interface {
 	Save(ctx context.Context, review *entity.Review) error
-	FindByCustomerID(ctx context.Context, customerID int64) ([]entity.Review, error)
 }

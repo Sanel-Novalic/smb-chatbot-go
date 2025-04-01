@@ -7,25 +7,19 @@ import (
 	"sync"
 	"time"
 
-	"smb-chatbot/internal/usecase"
+	"smb-chatbot/internal/entity"
 )
-
-type HistoryEntry struct {
-	IsUserMessage bool      `json:"is_user_message"`
-	Text          string    `json:"text"`
-	Timestamp     time.Time `json:"timestamp"`
-}
 
 type MockMessengerClient struct {
 	mu           sync.RWMutex
 	SentMessages map[int64][]string
-	History      map[int64][]HistoryEntry
+	History      map[int64][]entity.HistoryEntry
 }
 
 func NewMockMessengerClient() *MockMessengerClient {
 	return &MockMessengerClient{
 		SentMessages: make(map[int64][]string),
-		History:      make(map[int64][]HistoryEntry),
+		History:      make(map[int64][]entity.HistoryEntry),
 	}
 }
 
@@ -36,7 +30,7 @@ func (m *MockMessengerClient) SendMessage(ctx context.Context, chatID int64, tex
 	fmt.Printf("MOCK MESSENGER: Attempting to send message to chat %d: %s\n", chatID, text)
 	m.SentMessages[chatID] = append(m.SentMessages[chatID], text)
 
-	entry := HistoryEntry{
+	entry := entity.HistoryEntry{
 		IsUserMessage: false,
 		Text:          text,
 		Timestamp:     time.Now(),
@@ -49,7 +43,7 @@ func (m *MockMessengerClient) SendMessage(ctx context.Context, chatID int64, tex
 func (m *MockMessengerClient) AddHistory(chatID int64, isUser bool, text string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	entry := HistoryEntry{
+	entry := entity.HistoryEntry{
 		IsUserMessage: isUser,
 		Text:          text,
 		Timestamp:     time.Now(),
@@ -58,12 +52,10 @@ func (m *MockMessengerClient) AddHistory(chatID int64, isUser bool, text string)
 	log.Printf("MOCK MESSENGER: Added history for chat %d (user=%t): %s\n", chatID, isUser, text)
 }
 
-func (m *MockMessengerClient) GetHistory(chatID int64) []HistoryEntry {
+func (m *MockMessengerClient) GetHistory(chatID int64) []entity.HistoryEntry {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	historyCopy := make([]HistoryEntry, len(m.History[chatID]))
+	historyCopy := make([]entity.HistoryEntry, len(m.History[chatID]))
 	copy(historyCopy, m.History[chatID])
 	return historyCopy
 }
-
-var _ usecase.MessengerClient = (*MockMessengerClient)(nil)

@@ -5,95 +5,145 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"sync"
 	"time"
 
 	"smb-chatbot/internal/entity"
 
 	"github.com/google/uuid"
+	openai "github.com/sashabaranov/go-openai"
 )
 
-type reviewUseCase struct {
-	reviewRepo ReviewRepository
-	convoRepo  ConversationRepository
-	messenger  MessengerClient
+const chatHistoryLimit = 10
 
-	knownUsers  map[int64]bool
-	activeChats map[int64]bool
-	idMu        sync.RWMutex
+type reviewUseCase struct {
+	reviewRepo   ReviewRepository
+	convoRepo    ConversationRepository
+	historyRepo  HistoryRepository
+	messenger    MessengerClient
+	openaiClient *openai.Client
 }
 
 func NewReviewUseCase(
 	rr ReviewRepository,
 	cr ConversationRepository,
+	hr HistoryRepository,
 	mc MessengerClient,
+	oaiClient *openai.Client,
 ) ReviewUseCase {
 	uc := &reviewUseCase{
-		reviewRepo:  rr,
-		convoRepo:   cr,
-		messenger:   mc,
-		knownUsers:  make(map[int64]bool),
-		activeChats: make(map[int64]bool),
+		reviewRepo:   rr,
+		convoRepo:    cr,
+		historyRepo:  hr,
+		messenger:    mc,
+		openaiClient: oaiClient,
 	}
-	// Pre-populate simulated known IDs
-	uc.addKnownUser(101)
-	uc.addKnownUser(2002)
-	uc.addKnownUser(987)
-	uc.addActiveChat(505)
-	uc.addActiveChat(1001)
 	return uc
 }
 
-func (uc *reviewUseCase) HandleMessage(ctx context.Context, input HandleMessageInput) error {
-	if !uc.chatExists(input.ChatID) {
-		return fmt.Errorf("chat %d not found", input.ChatID)
-	}
-	if !uc.userExists(input.UserID) {
-		return fmt.Errorf("user %d not found", input.UserID)
-	}
-
+func (uc *reviewUseCase) HandleMessage(ctx context.Context, input HandleMessageInput) (string, error) {
 	conversation, err := uc.convoRepo.FindByChatID(ctx, input.ChatID)
 	if err != nil {
-		log.Printf("ERROR getting conversation for chat %d: %v", input.ChatID, err)
-		return fmt.Errorf("failed to get conversation: %w", err)
-	} else {
-		conversation.LastInteractionAt = time.Now()
+		log.Printf("CRITICAL ERROR: Failed to get or create conversation for chat %d: %v", input.ChatID, err)
+		return "", fmt.Errorf("failed to get conversation state: %w", err)
+	}
+
+	conversation.LastInteractionAt = time.Now()
+
+	userEntry := entity.HistoryEntry{
+		IsUserMessage: true,
+		Text:          input.Text,
+		Timestamp:     time.Now(),
+	}
+
+	if err := uc.historyRepo.SaveHistoryEntry(ctx, input.ChatID, userEntry); err != nil {
+		log.Printf("ERROR: Failed to save user message history for chat %d: %v", input.ChatID, err)
+		return "", fmt.Errorf("failed to save user message: %w", err)
 	}
 
 	currentState := conversation.State
-	log.Printf("Processing message for chat %d (User: %d, State: %s): '%s'\n", input.ChatID, input.UserID, currentState, input.Text)
 
 	var actionError error
 	newState := currentState
+	var assistantResponse string
 
 	switch currentState {
 	case entity.StateAwaitingReview:
 		actionError = uc.saveReview(ctx, input, conversation)
 		if actionError == nil {
 			newState = entity.StateIdle
-		} // Keep state AwaitingReview if save fails? Or reset? Depends on desired retry logic.
+			assistantResponse, err = uc.getChatGPTResponse(ctx, input.ChatID, "The user just provided their review. Thank them for their feedback.")
+			if err != nil {
+				log.Printf("WARN: Failed to get ChatGPT thank you response for chat %d: %v", input.ChatID, err)
+				assistantResponse = "Thanks for your feedback!"
+			}
+		} else {
+			assistantResponse, err = uc.getChatGPTResponse(ctx, input.ChatID, "There was an error trying to save the user's review. Apologize and say we'll look into it.")
+			if err != nil {
+				log.Printf("WARN: Failed to get ChatGPT error response for chat %d: %v", input.ChatID, err)
+				assistantResponse = "Sorry, there was an error saving your review. We'll look into it." // Fallback
+			}
+		}
 
 	case entity.StateIdle:
 		lowerCaseText := strings.ToLower(input.Text)
-		isTrigger := strings.Contains(lowerCaseText, "thank")
+		triggerKeywords := []string{"thank", "thanks", "appreciate", "great", "awesome", "perfect", "helpful", "loved it"}
+		isTrigger := false
+		for _, keyword := range triggerKeywords {
+			if strings.Contains(lowerCaseText, keyword) {
+				isTrigger = true
+				break
+			}
+		}
+
 		if isTrigger {
-			log.Printf("Trigger keyword found from user %d in chat %d\n", input.UserID, input.ChatID)
-			actionError = uc.askForReview(ctx, input, conversation)
-			if actionError == nil {
-				newState = entity.StateAwaitingReview
+			log.Printf("Trigger keyword found from user %d in chat %d", input.UserID, input.ChatID)
+			newState = entity.StateAwaitingReview
+			prompt := fmt.Sprintf("The user expressed positive sentiment ('%s'). Ask them if they would be willing to leave a quick review about their experience.", input.Text)
+			assistantResponse, err = uc.getChatGPTResponse(ctx, input.ChatID, prompt)
+			if err != nil {
+				log.Printf("ERROR: Failed to get ChatGPT review request: %v", err)
+				actionError = err
+				assistantResponse = "We appreciate that! Would you mind leaving a review?"
 			}
 		} else {
-			log.Printf("Idle state, no trigger found for chat %d.", input.ChatID)
+			prompt := fmt.Sprintf("The user said: '%s'. Respond conversationally.", input.Text)
+			assistantResponse, err = uc.getChatGPTResponse(ctx, input.ChatID, prompt)
+			if err != nil {
+				log.Printf("ERROR: Failed to get ChatGPT response: %v", err)
+				actionError = err
+				assistantResponse = "Sorry, I'm having trouble connecting right now."
+			}
 		}
 
 	default:
-		log.Printf("Unhandled state '%s' for chat %d. Resetting to Idle.", currentState, input.ChatID)
 		newState = entity.StateIdle
+		assistantResponse, err = uc.getChatGPTResponse(ctx, input.ChatID, "My current state is unhandled. Respond generically and politely.")
+		if err != nil {
+			assistantResponse = "Let's start over. How can I help?"
+		}
+	}
+
+	if assistantResponse != "" {
+		sendErr := uc.messenger.SendMessage(ctx, input.ChatID, assistantResponse)
+		if sendErr != nil {
+			log.Printf("ERROR sending assistant message to chat %d: %v", input.ChatID, sendErr)
+			if actionError == nil {
+				actionError = fmt.Errorf("failed to send response message: %w", sendErr)
+			}
+		} else {
+			assistantEntry := entity.HistoryEntry{
+				IsUserMessage: false,
+				Text:          assistantResponse,
+				Timestamp:     time.Now(),
+			}
+			if histErr := uc.historyRepo.SaveHistoryEntry(ctx, input.ChatID, assistantEntry); histErr != nil {
+				log.Printf("ERROR: Failed to save assistant message history for chat %d: %v", input.ChatID, histErr)
+			}
+		}
 	}
 
 	if newState != currentState {
 		conversation.State = newState
-		conversation.LastInteractionAt = time.Now()
 		saveErr := uc.convoRepo.Save(ctx, conversation)
 		if saveErr != nil {
 			log.Printf("ERROR saving updated conversation state for chat %d: %v", input.ChatID, saveErr)
@@ -101,25 +151,72 @@ func (uc *reviewUseCase) HandleMessage(ctx context.Context, input HandleMessageI
 				actionError = fmt.Errorf("failed to save conversation state: %w", saveErr)
 			}
 		}
+	} else if actionError == nil {
+		saveErr := uc.convoRepo.Save(ctx, conversation)
+		if saveErr != nil {
+			log.Printf("ERROR saving conversation to update timestamp for chat %d: %v", input.ChatID, saveErr)
+		}
 	}
 
-	return actionError
+	return assistantResponse, actionError
 }
 
-func (uc *reviewUseCase) askForReview(ctx context.Context, input HandleMessageInput, conversation *entity.Conversation) error {
-	reviewRequestText := fmt.Sprintf("Thanks, %s! We appreciate your business. Would you mind leaving a quick review about your experience?", input.UserName)
-
-	err := uc.messenger.SendMessage(ctx, input.ChatID, reviewRequestText)
+func (uc *reviewUseCase) getChatGPTResponse(ctx context.Context, chatID int64, prompt string) (string, error) {
+	history, err := uc.historyRepo.GetHistory(ctx, chatID, chatHistoryLimit)
 	if err != nil {
-		log.Printf("ERROR sending review request to chat %d: %v\n", input.ChatID, err)
-		return fmt.Errorf("failed to send message: %w", err)
+		history = []entity.HistoryEntry{}
 	}
-	log.Printf("Sent review request to chat %d\n", input.ChatID)
-	return nil
+
+	messages := make([]openai.ChatCompletionMessage, 0, len(history)+2) // +2 for system and current user prompt
+
+	messages = append(messages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleSystem,
+		Content: "You are a friendly assistant for a small business helping gather customer reviews and answer questions.",
+	})
+
+	for _, entry := range history {
+		role := openai.ChatMessageRoleAssistant
+		if entry.IsUserMessage {
+			role = openai.ChatMessageRoleUser
+		}
+		messages = append(messages, openai.ChatCompletionMessage{
+			Role:    role,
+			Content: entry.Text,
+		})
+	}
+
+	messages = append(messages, openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleUser,
+		Content: prompt,
+	})
+
+	req := openai.ChatCompletionRequest{
+		Model:    openai.GPT3Dot5Turbo,
+		Messages: messages,
+	}
+
+	resp, err := uc.openaiClient.CreateChatCompletion(ctx, req)
+	if err != nil {
+		log.Printf("ERROR: OpenAI API call failed for chat %d: %v", chatID, err)
+		return "", fmt.Errorf("OpenAI API error: %w", err)
+	}
+
+	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
+		log.Printf("ERROR: OpenAI returned empty response for chat %d", chatID)
+		return "", fmt.Errorf("OpenAI returned empty response")
+	}
+
+	aiResponse := resp.Choices[0].Message.Content
+	log.Printf("ChatGPT response for chat %d: %s", chatID, aiResponse)
+	return aiResponse, nil
 }
 
 func (uc *reviewUseCase) saveReview(ctx context.Context, input HandleMessageInput, conversation *entity.Conversation) error {
-	reviewID, _ := uuid.NewRandom()
+	reviewID, err := uuid.NewRandom()
+	if err != nil {
+		log.Printf("ERROR generating UUID for review: %v", err)
+		return fmt.Errorf("failed to generate review id: %w", err)
+	}
 
 	review := &entity.Review{
 		ID:         reviewID.String(),
@@ -129,45 +226,12 @@ func (uc *reviewUseCase) saveReview(ctx context.Context, input HandleMessageInpu
 		ReceivedAt: time.Now(),
 	}
 
-	err := uc.reviewRepo.Save(ctx, review)
+	err = uc.reviewRepo.Save(ctx, review)
 	if err != nil {
 		log.Printf("ERROR saving review for customer %d: %v\n", input.UserID, err)
 		return fmt.Errorf("failed to save review: %w", err)
 	}
 	log.Printf("Saved review %s from customer %d\n", review.ID, input.UserID)
 
-	err = uc.messenger.SendMessage(ctx, input.ChatID, "Thanks for your feedback!")
-	if err != nil {
-		log.Printf("ERROR sending review confirmation to chat %d: %v\n", input.ChatID, err)
-	}
-
 	return nil
-}
-
-// Internal methods for managing simulated IDs
-func (uc *reviewUseCase) addKnownUser(userID int64) {
-	uc.idMu.Lock()
-	defer uc.idMu.Unlock()
-	uc.knownUsers[userID] = true
-	log.Printf("SIM: Added known user %d\n", userID)
-}
-func (uc *reviewUseCase) userExists(userID int64) bool {
-	uc.idMu.RLock()
-	defer uc.idMu.RUnlock()
-	exists := uc.knownUsers[userID]
-	log.Printf("SIM: Checked user %d exists: %t\n", userID, exists)
-	return exists
-}
-func (uc *reviewUseCase) addActiveChat(chatID int64) {
-	uc.idMu.Lock()
-	defer uc.idMu.Unlock()
-	uc.activeChats[chatID] = true
-	log.Printf("SIM: Added active chat %d\n", chatID)
-}
-func (uc *reviewUseCase) chatExists(chatID int64) bool {
-	uc.idMu.RLock()
-	defer uc.idMu.RUnlock()
-	exists := uc.activeChats[chatID]
-	log.Printf("SIM: Checked chat %d exists: %t\n", chatID, exists)
-	return exists
 }

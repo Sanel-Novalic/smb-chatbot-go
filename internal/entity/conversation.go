@@ -9,6 +9,12 @@ type Conversation struct {
 	LastInteractionAt time.Time
 }
 
+type HistoryEntry struct {
+	IsUserMessage bool      `json:"is_user_message"`
+	Text          string    `json:"text"`
+	Timestamp     time.Time `json:"timestamp"`
+}
+
 const (
 	StateIdle           = "Idle"
 	StateAwaitingReview = "AwaitingReview"
